@@ -72,6 +72,7 @@ class ProcessLoanSimulationUseCase {
         let currentLoanValue = payload.loanValue;
         let calculationSuccess = false;
         let approvedRuleId = null;
+        let approvedRule = null;
         let calcResult = null;
         let attempts = 0;
         const maxAttempts = 3;
@@ -124,7 +125,30 @@ class ProcessLoanSimulationUseCase {
                         referenceCode: payload.referenceCode || null
                     };
                     calcResult = await this.qualiService.calculateSimulation(calcPayload);
+                    const resultData = calcResult?.data?.[0] || calcResult?.data || calcResult;
+                    let foundErrors = false;
+                    let errorMessage = '';
+                    if (Array.isArray(resultData?.erros) && resultData.erros.length > 0) {
+                        foundErrors = true;
+                        errorMessage = JSON.stringify(resultData.erros);
+                    }
+                    else if (Array.isArray(resultData?.errors) && resultData.errors.length > 0) {
+                        foundErrors = true;
+                        errorMessage = JSON.stringify(resultData.errors);
+                    }
+                    else if (Array.isArray(resultData?.refinancing?.erros) && resultData.refinancing.erros.length > 0) {
+                        foundErrors = true;
+                        errorMessage = JSON.stringify(resultData.refinancing.erros);
+                    }
+                    else if (Array.isArray(resultData?.refinancing?.errors) && resultData.refinancing.errors.length > 0) {
+                        foundErrors = true;
+                        errorMessage = JSON.stringify(resultData.refinancing.errors);
+                    }
+                    if (foundErrors) {
+                        throw new Error(`Cálculo negado pela regra (erros lógicos): ${errorMessage}`);
+                    }
                     approvedRuleId = rule.id;
+                    approvedRule = rule;
                     calculationSuccess = true;
                     if (db && internalId)
                         await this.logStep(db, internalId, `step1_calc_attempt_${attempts}_rule_${rule.code}`, true, calcResult);
@@ -157,29 +181,41 @@ class ProcessLoanSimulationUseCase {
                 details: attemptsLogs
             };
         }
-        return { approvedRuleId, currentLoanValue, calcResult, attempts, attemptsLogs };
+        return { approvedRuleId, approvedRule, currentLoanValue, calcResult, attempts, attemptsLogs };
     }
     async executeUpToStep2(payload) {
         const db = await (0, sqlite_1.getDatabase)();
+        const executionTrace = [];
         const result = await db.run('INSERT INTO simulations (status, payload) VALUES (?, ?)', ['pending', JSON.stringify(payload)]);
         const internalId = result.lastID;
+        executionTrace.push('Banco de Dados Local: Registro Criado');
         if (!internalId) {
             throw new Error('Failed to insert simulation into local database');
         }
+        let createPayload;
         try {
             // Passo 1: Smart Calculation
-            const { approvedRuleId, currentLoanValue, calcResult } = await this.executeSmartCalculation(payload, internalId, db);
+            const { approvedRuleId, approvedRule, currentLoanValue, calcResult } = await this.executeSmartCalculation(payload, internalId, db);
+            executionTrace.push('Passo 1 (Cálculo Prévio): Sucesso');
+            const calcData = calcResult?.data?.[0] || (Array.isArray(calcResult?.data) ? calcResult.data[0] : (calcResult?.data || (Array.isArray(calcResult) ? calcResult[0] : calcResult)));
+            const calcRefinancing = calcData?.refinancing;
+            const refinancingData = payload.refinancing ? {
+                term: calcRefinancing?.term || approvedRule?.items?.[0]?.term || payload.refinancing?.term,
+                rate: calcRefinancing?.rate || approvedRule?.items?.[0]?.rate || payload.refinancing?.rate,
+                installmentValue: calcRefinancing?.installmentValue || payload.refinancing?.installmentValue
+            } : undefined;
             // Montar Payload do Passo 2
-            const createPayload = {
+            createPayload = {
                 ...payload.borrowerData,
                 items: [
                     {
                         ruleId: approvedRuleId,
-                        hasInsurance: payload.hasInsurance || false,
-                        installmentValue: payload.installmentValue || payload.originContract?.installmentValue,
+                        operationCode: payload.operationCode || 4,
                         loanValue: currentLoanValue,
-                        rate: payload.rate,
                         term: payload.term || payload.originContract?.term,
+                        installmentValue: payload.installmentValue || payload.originContract?.installmentValue,
+                        rate: payload.rate,
+                        hasInsurance: payload.hasInsurance || false,
                         originContract: payload.originContract ? {
                             lenderCode: payload.originContract.lenderCode,
                             dueBalanceValue: payload.originContract.dueBalanceValue,
@@ -189,13 +225,8 @@ class ProcessLoanSimulationUseCase {
                             ...(payload.originContract.installmentsRemaining !== undefined && { installmentsRemaining: payload.originContract.installmentsRemaining }),
                             ...(payload.originContract.installmentValue !== undefined && { installmentValue: payload.originContract.installmentValue })
                         } : null,
-                        refinancing: payload.refinancing ? {
-                            term: calcResult?.data?.[0]?.refinancing?.term || payload.refinancing.term,
-                            rate: calcResult?.data?.[0]?.refinancing?.rate || payload.refinancing.rate,
-                            installmentValue: calcResult?.data?.[0]?.refinancing?.installmentValue || payload.refinancing.installmentValue
-                        } : undefined,
-                        referenceCode: payload.referenceCode || null,
-                        ...calcResult?.data?.[0]
+                        ...(refinancingData && { refinancing: refinancingData }),
+                        ...(payload.referenceCode && { referenceCode: payload.referenceCode })
                     }
                 ],
                 step: { code: 0, name: null },
@@ -205,6 +236,7 @@ class ProcessLoanSimulationUseCase {
             // Passo 2: Criação da Simulação
             const simResult = await this.qualiService.createSimulation(createPayload);
             const simulationId = simResult?.data?.simulation_id || simResult?.simulation_id || simResult?.id;
+            executionTrace.push('Passo 2 (Criação da Proposta): Sucesso');
             if (!simulationId && !payload.validate)
                 throw new Error('Falha ao obter simulation_id no Passo 2.');
             if (simulationId) {
@@ -219,12 +251,15 @@ class ProcessLoanSimulationUseCase {
                 success: true,
                 internalId,
                 simulationId,
-                step2Result: simResult
+                step2Result: simResult,
+                executionTrace,
+                debugPayloadSent: createPayload
             };
         }
         catch (error) {
-            const errorMessage = error.message || (error.response?.data ? JSON.stringify(error.response.data) : 'Erro desconhecido');
-            const details = error.details || null;
+            executionTrace.push('Processo Falhou ou Abortado na etapa atual');
+            const errorMessage = error.response?.data ? JSON.stringify(error.response.data) : (error.message || 'Erro desconhecido');
+            const details = error.details || { trace: executionTrace, payload_that_failed: payload, final_create_payload: createPayload };
             await this.logStep(db, internalId, 'error', false, { error: errorMessage, details });
             await db.run('UPDATE simulations SET status = ?, error_message = ? WHERE id = ?', ['error', errorMessage, internalId]);
             // eslint-disable-next-line no-throw-literal
@@ -239,17 +274,25 @@ class ProcessLoanSimulationUseCase {
             throw new Error('Failed to insert simulation into local database');
         }
         try {
-            const { approvedRuleId, currentLoanValue, calcResult } = await this.executeSmartCalculation(payload, internalId, db);
+            const { approvedRuleId, approvedRule, currentLoanValue, calcResult } = await this.executeSmartCalculation(payload, internalId, db);
+            const calcData = calcResult?.data?.[0] || (Array.isArray(calcResult?.data) ? calcResult.data[0] : (calcResult?.data || (Array.isArray(calcResult) ? calcResult[0] : calcResult)));
+            const calcRefinancing = calcData?.refinancing;
+            const refinancingData = payload.refinancing ? {
+                term: calcRefinancing?.term || approvedRule?.items?.[0]?.term || payload.refinancing?.term,
+                rate: calcRefinancing?.rate || approvedRule?.items?.[0]?.rate || payload.refinancing?.rate,
+                installmentValue: calcRefinancing?.installmentValue || payload.refinancing?.installmentValue
+            } : undefined;
             const createPayload = {
                 ...payload.borrowerData,
                 items: [
                     {
                         ruleId: approvedRuleId,
-                        hasInsurance: payload.hasInsurance || false,
-                        installmentValue: payload.installmentValue || payload.originContract?.installmentValue,
+                        operationCode: payload.operationCode || 4,
                         loanValue: currentLoanValue,
-                        rate: payload.rate,
                         term: payload.term || payload.originContract?.term,
+                        installmentValue: payload.installmentValue || payload.originContract?.installmentValue,
+                        rate: payload.rate,
+                        hasInsurance: payload.hasInsurance || false,
                         originContract: payload.originContract ? {
                             lenderCode: payload.originContract.lenderCode,
                             dueBalanceValue: payload.originContract.dueBalanceValue,
@@ -259,13 +302,8 @@ class ProcessLoanSimulationUseCase {
                             ...(payload.originContract.installmentsRemaining !== undefined && { installmentsRemaining: payload.originContract.installmentsRemaining }),
                             ...(payload.originContract.installmentValue !== undefined && { installmentValue: payload.originContract.installmentValue })
                         } : null,
-                        refinancing: payload.refinancing ? {
-                            term: calcResult?.data?.[0]?.refinancing?.term || payload.refinancing.term,
-                            rate: calcResult?.data?.[0]?.refinancing?.rate || payload.refinancing.rate,
-                            installmentValue: calcResult?.data?.[0]?.refinancing?.installmentValue || payload.refinancing.installmentValue
-                        } : undefined,
-                        referenceCode: payload.referenceCode || null,
-                        ...calcResult?.data?.[0]
+                        ...(refinancingData && { refinancing: refinancingData }),
+                        ...(payload.referenceCode && { referenceCode: payload.referenceCode })
                     }
                 ],
                 step: { code: 0, name: null },
@@ -304,7 +342,7 @@ class ProcessLoanSimulationUseCase {
             };
         }
         catch (error) {
-            const errorMessage = error.message || (error.response?.data ? JSON.stringify(error.response.data) : 'Erro desconhecido');
+            const errorMessage = error.response?.data ? JSON.stringify(error.response.data) : (error.message || 'Erro desconhecido');
             const details = error.details || null;
             await this.logStep(db, internalId, 'error', false, { error: errorMessage, details });
             await db.run('UPDATE simulations SET status = ?, error_message = ? WHERE id = ?', ['error', errorMessage, internalId]);

@@ -3,6 +3,8 @@ import { ProcessLoanSimulationUseCase } from '../useCases/ProcessLoanSimulationU
 import { QualiIntegrationService } from '../services/quali/QualiIntegrationService';
 import { getDatabase } from '../database/sqlite';
 
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
 const qualiService = new QualiIntegrationService();
 const processUseCase = new ProcessLoanSimulationUseCase();
 
@@ -48,8 +50,22 @@ export class SimulationController {
 
   public async calculate(req: Request, res: Response): Promise<void> {
     try {
-      const result = await qualiService.calculateSimulation(req.body);
-      res.status(200).json(result);
+      const items = req.body.items || [];
+      if (!Array.isArray(items) || items.length === 0) {
+        throw new Error('Nenhum item (contrato) enviado. A propriedade "items" é obrigatória e deve ser um array.');
+      }
+      
+      const results = [];
+      for (let i = 0; i < items.length; i++) {
+        if (i > 0) {
+          console.log('Aguardando 3000ms para evitar rate limit na JoinBank...');
+          await delay(3000);
+        }
+        const calcResult = await qualiService.calculateSimulation(items[i]);
+        results.push(calcResult);
+      }
+      
+      res.status(200).json({ success: true, data: results });
     } catch (error: any) {
       res.status(error.response?.status || 500).json(error.response?.data || { message: error.message });
     }
