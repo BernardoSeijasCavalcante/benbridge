@@ -157,8 +157,8 @@ export class ProcessLoanSimulationUseCase {
             };
 
             if (!isFirstCalculation) {
-              console.log('Aguardando 3000ms para evitar rate limit na JoinBank...');
-              await delay(3000);
+              console.log('Aguardando 500ms para evitar rate limit na JoinBank...');
+              await delay(500);
             }
             isFirstCalculation = false;
 
