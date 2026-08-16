@@ -1,0 +1,11 @@
+{
+    "success": true,
+    "internalId": 23,
+    "identity": "14310094821",
+    "benefitNumber": "254463045",
+    "in100": {
+        "queryId": "b15129ab-9f89-4e87-9de8-9a696616e10b",
+        "status": "pending_authorization"
+    },
+    "message": "Dados recuperados, payload salvo e IN100 iniciada. Aguardando autorização do cliente."
+}

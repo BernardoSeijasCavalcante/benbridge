@@ -1,7 +1,6 @@
 import { Request, Response } from 'express';
 import axios from 'axios';
 import { ProcessLoanSimulationUseCase } from '../useCases/ProcessLoanSimulationUseCase';
-import { ProcessContinuationUseCase } from '../useCases/ProcessContinuationUseCase';
 import { IN100WorkerUseCase } from '../useCases/IN100WorkerUseCase';
 import { QualiIntegrationService } from '../services/quali/QualiIntegrationService';
 import { getDatabase } from '../database/sqlite';
@@ -10,7 +9,6 @@ const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 const qualiService = new QualiIntegrationService();
 const processUseCase = new ProcessLoanSimulationUseCase();
-const processContinuationUseCase = new ProcessContinuationUseCase();
 const in100WorkerUseCase = new IN100WorkerUseCase();
 
 export class SimulationController {
@@ -45,7 +43,7 @@ export class SimulationController {
   // Novo Endpoint: Smart Creation (Datahub + Passos 1 e 2)
   public async processSmartCreation(req: Request, res: Response): Promise<void> {
     try {
-      const { beneficio, items, files, validate, operationCode } = req.body;
+      const { beneficio, items, files, validate, bank = 'qualibank' } = req.body;
       const datahubApiKey = process.env.DATAHUB_API_KEY;
 
       if (!datahubApiKey) {
@@ -112,35 +110,35 @@ export class SimulationController {
       // Mapear dados para o payload da Quali
       const borrowerData = {
         borrower: {
-          name: offlineData.Beneficiario.Nome,
+          name: offlineData.Beneficiario.Nome || 'NOME NÃO INFORMADO',
           identity: offlineData.Beneficiario.CPF,
           benefit: offlineData.Beneficiario.Beneficio,
-          benefitState: offlineData.Beneficiario.UFBeneficio || offlineData.Beneficiario.UF,
-          benefitStartDate: offlineData.Beneficiario.DIB,
+          benefitState: offlineData.Beneficiario.UFBeneficio || offlineData.Beneficiario.UF || 'SP',
+          benefitStartDate: offlineData.Beneficiario.DIB || '2020-01-01',
           benefitPaymentMethod: offlineData.DadosBancarios?.MeioPagamento === "2" ? 2 : 1,
           benefitType: offlineData.Beneficiario.Especie ? parseInt(offlineData.Beneficiario.Especie, 10) : 42,
-          birthDate: offlineData.Beneficiario.DataNascimento,
-          motherName: offlineData.Beneficiario.NomeMae,
+          birthDate: offlineData.Beneficiario.DataNascimento || '1970-01-01',
+          motherName: offlineData.Beneficiario.NomeMae || 'MAE NAO INFORMADA',
           maritalStatus: 'Solteiro', // Regra: Sempre solteiro
           sex: offlineData.Beneficiario.Sexo === 'M' ? 'Masculino' : 'Feminino',
-          income: offlineData.ResumoFinanceiro?.ValorBeneficio || 0,
-          phone: offlineData.Telefone && offlineData.Telefone.length > 0 ? offlineData.Telefone[0] : '',
+          income: offlineData.ResumoFinanceiro?.ValorBeneficio || 1500,
+          phone: offlineData.Telefone && offlineData.Telefone.length > 0 ? offlineData.Telefone[0] : '11999999999',
           email: email,
           address: {
             street: addr.street,
             number: addr.number,
             complement: '',
-            district: offlineData.Beneficiario.Bairro || '',
-            city: offlineData.Beneficiario.Cidade || '',
-            state: offlineData.Beneficiario.UF || '',
-            zipCode: offlineData.Beneficiario.CEP || ''
+            district: offlineData.Beneficiario.Bairro || 'Centro',
+            city: offlineData.Beneficiario.Cidade || 'São Paulo',
+            state: offlineData.Beneficiario.UF || 'SP',
+            zipCode: offlineData.Beneficiario.CEP || '01001000'
           },
           document: {
             type: { code: 'RG', name: 'Registro Geral' },
-            number: offlineData.Beneficiario.Rg,
+            number: offlineData.Beneficiario.Rg || '000000000',
             issuingDate: '2022-10-10', // Regra definida
             issuingEntity: 'SSP', // Regra definida
-            issuingState: offlineData.Beneficiario.UF
+            issuingState: offlineData.Beneficiario.UF || 'SP'
           }
         },
         creditBankAccount: {
@@ -156,16 +154,46 @@ export class SimulationController {
         items: items || [],
         files: files || [],
         validate,
-        operationCode: operationCode || 4
+        bank
       };
 
-      const result = await processUseCase.executeUpToStep2(processPayload);
+      const db = await getDatabase();
+      const result = await db.run(
+        'INSERT INTO simulations (status, payload) VALUES (?, ?)',
+        ['pending_in100', JSON.stringify(processPayload)]
+      );
+      const internalId = result.lastID;
+
+      if (!internalId) {
+        throw new Error('Falha ao inserir simulação no banco de dados local.');
+      }
+
+      // Iniciar Consulta IN100
+      const in100Result = await qualiService.initiateIN100Query(borrowerData.borrower.identity, borrowerData.borrower.benefit);
+      
+      const queryId = in100Result?.data?.id || in100Result?.id || in100Result?.query_inss_balance_id;
+      const authUrl = in100Result?.data?.authorizationUrl || in100Result?.data?.link || in100Result?.authorizationUrl || in100Result?.link;
+
+      if (!queryId) {
+        throw new Error('Identificador da consulta IN100 não retornado pela bancarizadora.');
+      }
+
+      await db.run(
+        'UPDATE simulations SET in100_query_id = ?, in100_auth_url = ?, in100_status = ? WHERE id = ?',
+        [queryId, authUrl || null, 'pending_authorization', internalId]
+      );
 
       res.status(200).json({
         success: true,
-        internalId: result.internalId,
+        internalId,
         identity: borrowerData.borrower.identity,
-        benefitNumber: borrowerData.borrower.benefit
+        benefitNumber: borrowerData.borrower.benefit,
+        in100: {
+          queryId,
+          authUrl,
+          status: 'pending_authorization'
+        },
+        message: 'Dados recuperados, payload salvo e IN100 iniciada. Aguardando autorização do cliente.'
       });
     } catch (error: any) {
       const statusCode = error.response?.status || 500;
@@ -178,38 +206,20 @@ export class SimulationController {
     }
   }
 
-  // Novo Endpoint: Continuação (Passos 3, 4 e IN100)
-  public async processContinuation(req: Request, res: Response): Promise<void> {
-    try {
-      const { internalId, identity, benefitNumber } = req.body;
-      const geolocation = {
-        latitude: req.body.latitude || '-23.5489',
-        longitude: req.body.longitude || '-46.6388'
-      };
-
-      if (!internalId || !identity || !benefitNumber) {
-        throw new Error('Parâmetros obrigatórios ausentes: internalId, identity, benefitNumber.');
-      }
-
-      const result = await processContinuationUseCase.execute(internalId, identity, benefitNumber, geolocation);
-      res.status(200).json(result);
-    } catch (error: any) {
-      res.status(500).json({ success: false, message: error.message, details: error.details });
-    }
-  }
-
-  // Novo Endpoint: Checar IN100 e Finalizar (Manual Polling Front-end)
+  // Novo Endpoint: Checar IN100 e Processar Restante do Fluxo
   public async checkIn100AndFinish(req: Request, res: Response): Promise<void> {
     try {
       const { internalId } = req.params;
+      const { latitude, longitude } = req.body; // Geolocalização real enviada pelo client
+
       if (!internalId) {
         throw new Error('Parâmetro obrigatório ausente: internalId.');
       }
 
-      const result = await in100WorkerUseCase.executeForSimulation(Number(internalId));
+      const result = await in100WorkerUseCase.executeForSimulation(Number(internalId), undefined, latitude, longitude);
       res.status(200).json(result);
     } catch (error: any) {
-      res.status(500).json({ success: false, message: error.message });
+      res.status(500).json({ success: false, message: error.message, details: error.details });
     }
   }
 
@@ -231,13 +241,24 @@ export class SimulationController {
         throw new Error('Nenhum item (contrato) enviado. A propriedade "items" é obrigatória e deve ser um array.');
       }
       
+      for (let i = 0; i < items.length; i++) {
+        if (items[i].originContract && !items[i].originContract.contractDate) {
+          throw new Error(`Item ${i}: O atributo "contractDate" é obrigatório dentro de "originContract".`);
+        }
+      }
+      
       const results = [];
       for (let i = 0; i < items.length; i++) {
         if (i > 0) {
           console.log('Aguardando 500ms para evitar rate limit na JoinBank...');
           await delay(500);
         }
-        const calcResult = await qualiService.calculateSimulation(items[i]);
+        
+        const payloadToSend = { ...items[i] };
+        delete payloadToSend.hasInsurance;
+        delete payloadToSend.operationCode;
+
+        const calcResult = await qualiService.calculateSimulation(payloadToSend);
         results.push(calcResult);
       }
       
@@ -249,7 +270,17 @@ export class SimulationController {
 
   public async create(req: Request, res: Response): Promise<void> {
     try {
-      const result = await qualiService.createSimulation(req.body);
+      const payloadToSend = { ...req.body };
+      delete payloadToSend.operationCode;
+      
+      if (Array.isArray(payloadToSend.items)) {
+        payloadToSend.items = payloadToSend.items.map((item: any) => {
+          const { hasInsurance, operationCode, ...rest } = item;
+          return rest;
+        });
+      }
+
+      const result = await qualiService.createSimulation(payloadToSend);
       res.status(200).json(result);
     } catch (error: any) {
       res.status(error.response?.status || 500).json(error.response?.data || { message: error.message });

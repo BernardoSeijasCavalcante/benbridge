@@ -1,6 +1,7 @@
 import { QualiApiClient } from './QualiApiClient';
+import { IBankIntegrationService } from '../interfaces/IBankIntegrationService';
 
-export class QualiIntegrationService {
+export class QualiIntegrationService implements IBankIntegrationService {
   private apiClient: QualiApiClient;
 
   constructor() {

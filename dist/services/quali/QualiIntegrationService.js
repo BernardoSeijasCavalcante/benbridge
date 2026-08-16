@@ -70,5 +70,20 @@ class QualiIntegrationService {
         });
         return response.data;
     }
+    // Consulta IN100 - Inicia a consulta
+    async initiateIN100Query(identity, benefitNumber) {
+        const client = this.apiClient.getClient();
+        const response = await client.post('/v3/query-inss-balances/finder', {
+            identity,
+            benefitNumber
+        });
+        return response.data;
+    }
+    // Consulta IN100 - Verifica o status
+    async checkIN100Status(queryId) {
+        const client = this.apiClient.getClient();
+        const response = await client.get(`/v3/query-inss-balances/${queryId}`);
+        return response.data;
+    }
 }
 exports.QualiIntegrationService = QualiIntegrationService;

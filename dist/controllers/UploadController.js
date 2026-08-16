@@ -26,12 +26,14 @@ const upload = (0, multer_1.default)({
     storage,
     limits: { fileSize: 260 * 1024 * 1024 }, // 260MB limit
     fileFilter: (req, file, cb) => {
-        const allowedMimeTypes = ['image/jpeg', 'image/png', 'application/pdf'];
-        if (allowedMimeTypes.includes(file.mimetype)) {
+        const allowedMimeTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'application/pdf'];
+        const allowedExtensions = ['.jpg', '.jpeg', '.png', '.webp', '.pdf'];
+        const ext = path_1.default.extname(file.originalname).toLowerCase();
+        if (allowedMimeTypes.includes(file.mimetype) || allowedExtensions.includes(ext)) {
             cb(null, true);
         }
         else {
-            cb(new Error('Invalid file type. Only JPEG, PNG and PDF are allowed.'));
+            cb(new Error('Invalid file type. Only JPEG, JPG, PNG, WEBP and PDF are allowed.'));
         }
     }
 }).single('file');
@@ -66,8 +68,8 @@ class UploadController {
                     });
                 }
                 catch (error) {
-                    // Arquivo NÃO será apagado em caso de erro para permitir o debug local pelo desenvolvedor.
-                    // fs.unlink(filePath, () => {});
+                    // Sempre deletar o arquivo para não persisti-lo, conforme especificação
+                    fs_1.default.unlink(filePath, () => { });
                     const status = error.response?.status;
                     const data = error.response?.data;
                     const message = error.message;

@@ -25,6 +25,9 @@ async function getDatabase() {
       payload TEXT NOT NULL,
       response TEXT,
       error_message TEXT,
+      in100_query_id TEXT,
+      in100_auth_url TEXT,
+      in100_status TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
@@ -39,5 +42,17 @@ async function getDatabase() {
       FOREIGN KEY(simulation_internal_id) REFERENCES simulations(id)
     );
   `);
+    try {
+        await dbInstance.exec('ALTER TABLE simulations ADD COLUMN in100_query_id TEXT;');
+    }
+    catch (e) { }
+    try {
+        await dbInstance.exec('ALTER TABLE simulations ADD COLUMN in100_auth_url TEXT;');
+    }
+    catch (e) { }
+    try {
+        await dbInstance.exec('ALTER TABLE simulations ADD COLUMN in100_status TEXT;');
+    }
+    catch (e) { }
     return dbInstance;
 }

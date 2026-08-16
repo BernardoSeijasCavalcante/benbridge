@@ -8,7 +8,9 @@ const controller = new SimulationController_1.SimulationController();
 const uploadController = new UploadController_1.UploadController();
 // --- Fluxo Completo Automático (BenBridge Engine) ---
 router.post('/process', controller.processFull.bind(controller));
+router.post('/process-smart-creation', controller.processSmartCreation.bind(controller));
 router.post('/process-creation', controller.processCreationOnly.bind(controller));
+router.post('/process-finish-in100/:internalId', controller.checkIn100AndFinish.bind(controller));
 // --- Fluxos Parciais (Manuais) ---
 router.post('/smart-calculation', controller.calculateSmart.bind(controller));
 router.post('/calculation', controller.calculate.bind(controller));

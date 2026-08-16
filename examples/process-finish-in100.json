@@ -1,0 +1,18 @@
+{
+    "success": true,
+    "internalId": 23,
+    "in100": {
+        "status": "completed",
+        "availableBalance": 0
+    },
+    "url": "https://signer.ajin.io/B7SVj6LF40lPRetV3slShYeDEKNqLt0bM4a2IExoInY6Gm3v6ifWCa-m9hAvxetxp5Vwjc86z1s6zB0mG2jPFA",
+    "processResult": {
+        "..." // aqui vai o resultado do processamento da simulação do empréstimo
+    },
+    "executionTrace": [
+        "Consulta Status IN100: Retornou Payload",
+        "IN100 Análise: Saldo Disponível = 0",
+        "IN100 Análise: Aprovada",
+        "Delegado para ProcessLoanSimulationUseCase"
+    ]
+}

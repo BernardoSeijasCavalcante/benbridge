@@ -1,11 +1,13 @@
-import { QualiIntegrationService } from '../services/quali/QualiIntegrationService';
+import { BankIntegrationFactory } from '../services/BankIntegrationFactory';
+import { IBankIntegrationService } from '../services/interfaces/IBankIntegrationService';
+import { ProcessLoanSimulationUseCase } from './ProcessLoanSimulationUseCase';
 import { getDatabase } from '../database/sqlite';
 
 export class IN100WorkerUseCase {
-  private qualiService: QualiIntegrationService;
+  private processLoanUseCase: ProcessLoanSimulationUseCase;
 
   constructor() {
-    this.qualiService = new QualiIntegrationService();
+    this.processLoanUseCase = new ProcessLoanSimulationUseCase();
   }
 
   private async logStep(db: any, internalId: number, step: string, success: boolean, data?: any) {
@@ -33,7 +35,7 @@ export class IN100WorkerUseCase {
   }
 
   // Método principal que verifica uma simulação específica (Pode ser chamado manualmente pelo frontend)
-  public async executeForSimulation(internalId: number, dbInstance?: any): Promise<any> {
+  public async executeForSimulation(internalId: number, dbInstance?: any, latitude?: string, longitude?: string): Promise<any> {
     const db = dbInstance || await getDatabase();
     
     const simulation = await db.get('SELECT * FROM simulations WHERE id = ?', [internalId]);
@@ -45,8 +47,8 @@ export class IN100WorkerUseCase {
       throw new Error(`A simulação (internalId ${internalId}) não possui in100_query_id associado.`);
     }
 
-    if (simulation.in100_status === 'approved' || simulation.in100_status === 'completed') {
-      return { status: simulation.in100_status, message: 'Consulta IN100 já processada e aprovada.' };
+    if (simulation.in100_status === 'completed') {
+      return { status: simulation.in100_status, message: 'Consulta IN100 e Formalização já concluídas com sucesso.' };
     }
     if (simulation.in100_status === 'rejected') {
       return { status: 'rejected', message: 'Consulta IN100 já foi processada e rejeitada por falta de margem.' };
@@ -57,80 +59,106 @@ export class IN100WorkerUseCase {
     const executionTrace: string[] = [];
 
     try {
-      // 1. Consultar status da IN100
-      const statusResult = await this.qualiService.checkIN100Status(queryId);
-      executionTrace.push('Consulta Status IN100: Retornou Payload');
-      
-      // O endpoint de consulta costuma retornar o payload final se aprovado, 
-      // ou um status pendente. Precisamos verificar se os dados existem.
-      const availableBalance = statusResult?.data?.availableTotalBalance ?? statusResult?.availableTotalBalance;
+      const simulationPayload = JSON.parse(simulation.payload || '{}');
+      const bankName = simulationPayload.bank || 'qualibank';
+      const bankService = BankIntegrationFactory.getService(bankName);
 
-      // Se não veio o campo de saldo, inferimos que ainda está pendente
-      if (availableBalance === undefined || availableBalance === null) {
-        return { status: 'pending_authorization', message: 'Aguardando o cliente autorizar a consulta IN100.', data: statusResult };
-      }
+      let saldoDisponivel = 0;
+      let isAlreadyApproved = simulation.in100_status === 'approved';
 
-      await this.logStep(db, internalId, 'step_in100_check', true, statusResult);
-      
-      // 2. Análise de Crédito
-      const saldoDisponivel = Number(availableBalance);
-      executionTrace.push(`IN100 Análise: Saldo Disponível = ${saldoDisponivel}`);
+      if (!isAlreadyApproved) {
+        // 1. Consultar status da IN100 apenas se ainda não aprovado
+        const statusResult = await bankService.checkIN100Status(queryId);
+        executionTrace.push('Consulta Status IN100: Retornou Payload');
+        
+        // O endpoint de consulta costuma retornar o payload final se aprovado, 
+        // ou um status pendente. Precisamos verificar se os dados existem.
+        const availableBalance = statusResult?.data?.availableTotalBalance ?? statusResult?.availableTotalBalance;
 
-      if (saldoDisponivel >= 0) {
-        // Aprovado
+        // Se não veio o campo de saldo, inferimos que ainda está pendente
+        if (availableBalance === undefined || availableBalance === null) {
+          return { status: 'pending_authorization', message: 'Aguardando o cliente autorizar a consulta IN100.', data: statusResult };
+        }
+
+        await this.logStep(db, internalId, 'step_in100_check', true, statusResult);
+        
+        saldoDisponivel = Number(availableBalance);
+        executionTrace.push(`IN100 Análise: Saldo Disponível = ${saldoDisponivel}`);
+
+        if (saldoDisponivel < 0) {
+          // Reprovado
+          const reason = `Análise Reprovada: Cliente possui margem negativa (R$ ${saldoDisponivel}).`;
+          await db.run("UPDATE simulations SET in100_status = 'rejected', status = 'rejected' WHERE id = ?", [internalId]);
+          await this.logStep(db, internalId, 'step_in100_check_failed', false, { reason, saldoDisponivel });
+          executionTrace.push(reason);
+
+          return {
+            success: false,
+            internalId,
+            simulationId,
+            in100: {
+              status: 'rejected',
+              availableBalance: saldoDisponivel
+            },
+            message: reason,
+            executionTrace
+          };
+        }
+
+        // Se passou, atualiza para aprovado no banco antes de rodar os passos
         await db.run("UPDATE simulations SET in100_status = 'approved' WHERE id = ?", [internalId]);
         executionTrace.push('IN100 Análise: Aprovada');
-
-        // Passo 5: Geração de Contratos
-        const actionsResult = await this.qualiService.createContracts(simulationId);
-        await this.logStep(db, internalId, 'step5_create_contracts', true, actionsResult);
-        executionTrace.push('Passo 5 (Geração de Contratos): Sucesso');
-
-        await db.run("UPDATE simulations SET status = 'contracts_created', in100_status = 'completed' WHERE id = ?", [internalId]);
-
-        // Passo 6 Opcional (Consulta final)
-        const finalContracts = await this.qualiService.querySimulationContracts(simulationId);
-        await this.logStep(db, internalId, 'step6_query_contracts', true, finalContracts);
-
-        await db.run('UPDATE simulations SET status = ?, response = ? WHERE id = ?', ['completed', JSON.stringify(finalContracts), internalId]);
-
-        return {
-          success: true,
-          internalId,
-          simulationId,
-          in100: {
-            status: 'completed',
-            availableBalance: saldoDisponivel
-          },
-          contracts: finalContracts,
-          executionTrace
-        };
-
       } else {
-        // Reprovado
-        const reason = `Análise Reprovada: Cliente possui margem negativa (R$ ${saldoDisponivel}).`;
-        await db.run("UPDATE simulations SET in100_status = 'rejected', status = 'rejected' WHERE id = ?", [internalId]);
-        await this.logStep(db, internalId, 'step_in100_check_failed', false, { reason, saldoDisponivel });
-        executionTrace.push(reason);
-
-        return {
-          success: false,
-          internalId,
-          simulationId,
-          in100: {
-            status: 'rejected',
-            availableBalance: saldoDisponivel
-          },
-          message: reason,
-          executionTrace
-        };
+        executionTrace.push('IN100 Análise: Já estava aprovada anteriormente. Retomando fluxo.');
       }
-    } catch (error: any) {
-      executionTrace.push('Falha ao checar status da IN100 ou ao executar Passo 5.');
-      const errorMessage = error.response?.data ? JSON.stringify(error.response.data) : (error.message || 'Erro desconhecido');
-      await this.logStep(db, internalId, 'error_in100_worker', false, { error: errorMessage, trace: executionTrace });
+
+      // 2. Análise de Crédito e Formalização (Passos 1 a 5)
+      const lat = latitude || '-23.5489';
+      const lon = longitude || '-46.6388';
+      const geolocation = { latitude: lat, longitude: lon };
+
+      const processResult = await this.processLoanUseCase.executeFromExistingId(internalId, geolocation, db);
       
-      throw new Error(`IN100WorkerUseCase Failed: ${errorMessage}`);
+      await db.run("UPDATE simulations SET in100_status = 'completed' WHERE id = ?", [internalId]);
+
+      let formalizationUrl = null;
+      if (processResult?.contracts && Array.isArray(processResult.contracts)) {
+        const contractWithUrl = processResult.contracts.find((c: any) => c?.signature?.url);
+        if (contractWithUrl) {
+          formalizationUrl = contractWithUrl.signature.url;
+        }
+      }
+
+      return {
+        success: true,
+        url: formalizationUrl,
+        internalId,
+        in100: {
+          status: 'completed',
+          availableBalance: saldoDisponivel
+        },
+        processResult,
+        executionTrace: [...executionTrace, 'Delegado para ProcessLoanSimulationUseCase']
+      };
+    } catch (error: any) {
+      executionTrace.push('Falha ao checar status da IN100 ou ao executar os Passos (1 a 5).');
+      const errorMessage = error.response?.data ? JSON.stringify(error.response.data) : (error.message || 'Erro desconhecido');
+      
+      let details = error.details;
+      if (!details) {
+        details = { trace: executionTrace };
+      } else {
+        if (details.trace) {
+          details.trace = [...executionTrace, ...details.trace];
+        } else {
+          details.trace = executionTrace;
+        }
+      }
+      
+      await this.logStep(db, internalId, 'error_in100_worker', false, { error: errorMessage, details });
+      
+      // eslint-disable-next-line no-throw-literal
+      throw { message: `IN100WorkerUseCase Failed: ${errorMessage}`, details };
     }
   }
 }

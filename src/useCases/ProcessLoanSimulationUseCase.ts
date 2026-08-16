@@ -1,13 +1,10 @@
-import { QualiIntegrationService } from '../services/quali/QualiIntegrationService';
+import { BankIntegrationFactory } from '../services/BankIntegrationFactory';
 import { getDatabase } from '../database/sqlite';
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export class ProcessLoanSimulationUseCase {
-  private qualiService: QualiIntegrationService;
-
   constructor() {
-    this.qualiService = new QualiIntegrationService();
   }
 
   private async logStep(db: any, internalId: number, step: string, success: boolean, data?: any) {
@@ -82,13 +79,22 @@ export class ProcessLoanSimulationUseCase {
   }
 
   public async executeSmartCalculation(payload: any, internalId?: number, db?: any): Promise<{ approvedItems: any[] }> {
-    const operationCode = payload.operationCode || 4;
-    const rulesResponse = await this.qualiService.getProductRules(operationCode);
+    const operationCode = 4; // Descartando operationCode do payload
+    const bankName = payload.bank || 'qualibank';
+    const bankService = BankIntegrationFactory.getService(bankName);
+    
+    const rulesResponse = await bankService.getProductRules(operationCode);
     const allRules = rulesResponse?.data || rulesResponse?.items || [];
 
     const items = payload.items || [];
     if (!Array.isArray(items) || items.length === 0) {
       throw new Error('Nenhum item (contrato) enviado. A propriedade "items" é obrigatória e deve ser um array.');
+    }
+
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].originContract && !items[i].originContract.contractDate) {
+        throw new Error(`Item ${i}: O atributo "contractDate" é obrigatório dentro de "originContract".`);
+      }
     }
 
     const approvedItems = [];
@@ -131,29 +137,22 @@ export class ProcessLoanSimulationUseCase {
         }
 
         for (const rule of validRules) {
+          let calcPayload: any;
           try {
-            const calcPayload = {
+            calcPayload = {
               ruleId: rule.id,
-              hasInsurance: item.hasInsurance || false,
               installmentValue: item.installmentValue || item.originContract?.installmentValue,
               loanValue: currentLoanValue,
               rate: item.rate,
               term: item.term || item.originContract?.term,
-              originContract: item.originContract ? {
-                lenderCode: item.originContract.lenderCode,
-                dueBalanceValue: item.originContract.dueBalanceValue,
-                ...(item.originContract.contractNumber !== undefined && { contractNumber: item.originContract.contractNumber }),
-                ...(item.originContract.contractDate !== undefined && { contractDate: item.originContract.contractDate }),
-                ...(item.originContract.term !== undefined && { term: item.originContract.term }),
-                ...(item.originContract.installmentsRemaining !== undefined && { installmentsRemaining: item.originContract.installmentsRemaining }),
-                ...(item.originContract.installmentValue !== undefined && { installmentValue: item.originContract.installmentValue })
-              } : null,
+              originContract: item.originContract,
               refinancing: item.refinancing ? {
-                term: rule.items?.[0]?.term || item.refinancing.term,
-                rate: rule.items?.[0]?.rate || item.refinancing.rate,
+                term: item.refinancing.term || rule.items?.[0]?.term,
+                rate: item.refinancing.rate || rule.items?.[0]?.rate,
                 installmentValue: item.refinancing.installmentValue
               } : undefined,
-              referenceCode: item.referenceCode || null
+              ...(item.desiredTerm !== undefined && { desiredTerm: item.desiredTerm }),
+              ...(item.referenceCode !== undefined && { referenceCode: item.referenceCode })
             };
 
             if (!isFirstCalculation) {
@@ -162,7 +161,7 @@ export class ProcessLoanSimulationUseCase {
             }
             isFirstCalculation = false;
 
-            calcResult = await this.qualiService.calculateSimulation(calcPayload);
+            calcResult = await bankService.calculateSimulation(calcPayload);
 
             const resultData = calcResult?.data?.[0] || calcResult?.data || calcResult;
 
@@ -193,16 +192,16 @@ export class ProcessLoanSimulationUseCase {
             if (db && internalId) await this.logStep(db, internalId, `step1_calc_item_${i}_attempt_${attempts}_rule_${rule.code}`, true, calcResult);
             break;
           } catch (error: any) {
-            const errLog = error.response?.data || error.message;
             attemptsLogs.push({
               ruleId: rule.id,
               ruleCode: rule.code,
               ruleName: rule.name,
               attempt: attempts + 1,
               loanValue: currentLoanValue,
-              error: errLog
+              payload_sent: calcPayload,
+              error: error.message || error
             });
-            if (db && internalId) await this.logStep(db, internalId, `step1_calc_item_${i}_attempt_${attempts}_rule_${rule.code}_failed`, false, { error: errLog });
+            if (db && internalId) await this.logStep(db, internalId, `step1_calc_item_${i}_attempt_${attempts}_rule_${rule.code}_failed`, false, { error: error.message || error, payload_sent: calcPayload });
           }
         }
 
@@ -271,12 +270,10 @@ export class ProcessLoanSimulationUseCase {
 
         return {
           ruleId: appItem.approvedRuleId,
-          operationCode: payload.operationCode || 4,
           loanValue: appItem.currentLoanValue,
           term: item.term || item.originContract?.term,
           installmentValue: item.installmentValue || item.originContract?.installmentValue,
           rate: item.rate,
-          hasInsurance: item.hasInsurance || false,
           originContract: item.originContract ? {
             lenderCode: item.originContract.lenderCode,
             dueBalanceValue: item.originContract.dueBalanceValue,
@@ -300,8 +297,11 @@ export class ProcessLoanSimulationUseCase {
         ...(payload.validate !== undefined && { validate: payload.validate })
       };
 
+      const bankName = payload.bank || 'qualibank';
+      const bankService = BankIntegrationFactory.getService(bankName);
+
       // Passo 2: Criação da Simulação
-      const simResult = await this.qualiService.createSimulation(createPayload);
+      const simResult = await bankService.createSimulation(createPayload);
       const simulationId = simResult?.data?.simulation_id || simResult?.simulation_id || simResult?.id;
       executionTrace.push('Passo 2 (Criação da Proposta): Sucesso');
 
@@ -349,8 +349,25 @@ export class ProcessLoanSimulationUseCase {
       throw new Error('Failed to insert simulation into local database');
     }
 
+    return this.executeFromExistingId(internalId, geolocation, db);
+  }
+
+  public async executeFromExistingId(internalId: number, geolocation: { latitude: string; longitude: string }, dbInstance?: any): Promise<any> {
+    const db = dbInstance || await getDatabase();
+    
+    const simulation = await db.get('SELECT * FROM simulations WHERE id = ?', [internalId]);
+    if (!simulation) {
+      throw new Error(`Simulação com internalId ${internalId} não encontrada.`);
+    }
+
+    const payload = JSON.parse(simulation.payload);
+    let createPayload: any = null;
+    const executionTrace: string[] = [];
+
     try {
+      executionTrace.push('Iniciando executeFromExistingId');
       const { approvedItems } = await this.executeSmartCalculation(payload, internalId, db);
+      executionTrace.push('Passo 1 (Cálculo Prévio): Sucesso para todos os itens');
 
       const createItems = approvedItems.map(appItem => {
         const item = appItem.originalItem;
@@ -365,27 +382,18 @@ export class ProcessLoanSimulationUseCase {
 
         return {
           ruleId: appItem.approvedRuleId,
-          operationCode: payload.operationCode || 4,
           loanValue: appItem.currentLoanValue,
           term: item.term || item.originContract?.term,
           installmentValue: item.installmentValue || item.originContract?.installmentValue,
           rate: item.rate,
-          hasInsurance: item.hasInsurance || false,
-          originContract: item.originContract ? {
-            lenderCode: item.originContract.lenderCode,
-            dueBalanceValue: item.originContract.dueBalanceValue,
-            ...(item.originContract.contractNumber !== undefined && { contractNumber: item.originContract.contractNumber }),
-            ...(item.originContract.contractDate !== undefined && { contractDate: item.originContract.contractDate }),
-            ...(item.originContract.term !== undefined && { term: item.originContract.term }),
-            ...(item.originContract.installmentsRemaining !== undefined && { installmentsRemaining: item.originContract.installmentsRemaining }),
-            ...(item.originContract.installmentValue !== undefined && { installmentValue: item.originContract.installmentValue })
-          } : null,
+          originContract: item.originContract,
           ...(refinancingData && { refinancing: refinancingData }),
-          ...(item.referenceCode && { referenceCode: item.referenceCode })
+          ...(item.desiredTerm !== undefined && { desiredTerm: item.desiredTerm }),
+          ...(item.referenceCode !== undefined && { referenceCode: item.referenceCode })
         };
       });
 
-      const createPayload = {
+      createPayload = {
         ...payload.borrowerData,
         items: createItems,
         step: { code: 0, name: null },
@@ -393,35 +401,48 @@ export class ProcessLoanSimulationUseCase {
         ...(payload.validate !== undefined && { validate: payload.validate })
       };
 
-      const simResult = await this.qualiService.createSimulation(createPayload);
+      const bankName = payload.bank || 'qualibank';
+      const bankService = BankIntegrationFactory.getService(bankName);
+
+      executionTrace.push('Passo 2 (Criação da Proposta): Iniciando envio para o banco');
+      const simResult = await bankService.createSimulation(createPayload);
       const simulationId = simResult?.data?.simulation_id || simResult?.simulation_id || simResult?.id;
 
       if (!simulationId) throw new Error('Falha ao obter simulation_id no Passo 2.');
 
       await db.run('UPDATE simulations SET simulation_id = ?, status = ? WHERE id = ?', [simulationId, 'created', internalId]);
-      await this.logStep(db, internalId, 'step2_creation', true, { simulationId });
+      await this.logStep(db, internalId, 'step2_creation', true, { simulationId, fullResult: simResult });
+      executionTrace.push('Passo 2 (Criação da Proposta): Sucesso');
 
-      const authTerm = await this.qualiService.getAuthTerm(simulationId);
+      executionTrace.push('Passo 3 (Termo de Autorização): Obtendo termo');
+      const authTerm = await bankService.getAuthTerm(simulationId);
       await this.logStep(db, internalId, 'step3_get_auth_term', true, authTerm);
 
       const termStatus = authTerm?.data?.status?.key || authTerm?.status?.key;
       const termKey = authTerm?.data?.key || authTerm?.key;
 
       if (termStatus !== 'signed') {
-        const acceptResult = await this.qualiService.acceptAuthTerm(termKey, geolocation.latitude, geolocation.longitude);
+        executionTrace.push('Passo 4 (Aceite do Termo): Iniciando aceite');
+        const acceptResult = await bankService.acceptAuthTerm(termKey, geolocation.latitude, geolocation.longitude);
         await this.logStep(db, internalId, 'step4_accept_auth_term', true, acceptResult);
+        executionTrace.push('Passo 4 (Aceite do Termo): Sucesso');
       } else {
         await this.logStep(db, internalId, 'step4_accept_auth_term', true, { skipped: true, reason: 'Already signed' });
+        executionTrace.push('Passo 4 (Aceite do Termo): Já assinado');
       }
 
       await db.run('UPDATE simulations SET status = ? WHERE id = ?', ['auth_term_signed', internalId]);
 
-      const actionsResult = await this.qualiService.createContracts(simulationId);
+      executionTrace.push('Passo 5 (Criação de Contratos): Iniciando criação');
+      const actionsResult = await bankService.createContracts(simulationId);
       await this.logStep(db, internalId, 'step5_create_contracts', true, actionsResult);
       await db.run('UPDATE simulations SET status = ? WHERE id = ?', ['contracts_created', internalId]);
+      executionTrace.push('Passo 5 (Criação de Contratos): Sucesso');
 
-      const finalContracts = await this.qualiService.querySimulationContracts(simulationId);
+      executionTrace.push('Passo 6 (Consulta de Contratos): Iniciando consulta');
+      const finalContracts = await bankService.querySimulationContracts(simulationId);
       await this.logStep(db, internalId, 'step6_query_contracts', true, finalContracts);
+      executionTrace.push('Passo 6 (Consulta de Contratos): Sucesso');
 
       await db.run('UPDATE simulations SET status = ?, response = ? WHERE id = ?', ['completed', JSON.stringify(finalContracts), internalId]);
 
@@ -433,8 +454,22 @@ export class ProcessLoanSimulationUseCase {
       };
 
     } catch (error: any) {
+      executionTrace.push('Processo Falhou ou Abortado na etapa atual');
       const errorMessage = error.response?.data ? JSON.stringify(error.response.data) : (error.message || 'Erro desconhecido');
-      const details = error.details || null;
+      
+      let details = error.details || {};
+      
+      // Mesclar a trace se já existir (por exemplo, de executeSmartCalculation)
+      if (details.trace) {
+        details.trace = [...executionTrace, ...details.trace];
+      } else {
+        details.trace = executionTrace;
+      }
+
+      // Adicionar payload_that_failed e final_create_payload
+      details.payload_that_failed = payload;
+      details.final_create_payload = createPayload;
+
       await this.logStep(db, internalId, 'error', false, { error: errorMessage, details });
       await db.run('UPDATE simulations SET status = ?, error_message = ? WHERE id = ?', ['error', errorMessage, internalId]);
 
