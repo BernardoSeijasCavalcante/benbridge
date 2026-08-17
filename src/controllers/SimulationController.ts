@@ -69,6 +69,31 @@ export class SimulationController {
         throw new Error('Não foi possível recuperar os dados do Beneficiário através do Datahub.');
       }
 
+      const missingData: string[] = [];
+
+      // Dados pessoais e do Benefício
+      if (!offlineData.Beneficiario.Nome) missingData.push('nome');
+      if (!offlineData.Beneficiario.DataNascimento) missingData.push('dataNascimento');
+      if (!offlineData.Beneficiario.NomeMae) missingData.push('nomeMae');
+      if (!offlineData.Beneficiario.Rg) missingData.push('rg');
+      if (!offlineData.Beneficiario.CPF) missingData.push('cpf');
+      if (!offlineData.Beneficiario.Beneficio) missingData.push('beneficio');
+      if (!offlineData.Beneficiario.Especie) missingData.push('especie');
+
+      // Endereço
+      if (!offlineData.Beneficiario.Endereco) missingData.push('endereco');
+      if (!offlineData.Beneficiario.Bairro) missingData.push('bairro');
+      if (!offlineData.Beneficiario.Cidade) missingData.push('cidade');
+      if (!offlineData.Beneficiario.CEP) missingData.push('cep');
+
+      // Dados Bancários
+      if (!offlineData.DadosBancarios?.Banco) missingData.push('banco');
+      if (!offlineData.DadosBancarios?.Agencia) missingData.push('agencia');
+      if (!offlineData.DadosBancarios?.ContaPagto) missingData.push('conta');
+
+      // Rendimento
+      if (!offlineData.ResumoFinanceiro?.ValorBeneficio) missingData.push('renda');
+
       // Formatadores e Defaults
       const parseAddress = (endereco: string) => {
         if (!endereco) return { street: 'NÃO INFORMADO', number: 'SN' };
@@ -183,6 +208,11 @@ export class SimulationController {
         [queryId, authUrl || null, 'pending_authorization', internalId]
       );
 
+      let responseMessage = 'Dados recuperados, payload salvo e IN100 iniciada. Aguardando autorização do cliente.';
+      if (missingData.length > 0) {
+        responseMessage = 'Atenção: faltam dados vitais do Datahub. Envie-os na próxima requisição (check-in100-and-finish). ' + responseMessage;
+      }
+
       res.status(200).json({
         success: true,
         internalId,
@@ -193,7 +223,8 @@ export class SimulationController {
           authUrl,
           status: 'pending_authorization'
         },
-        message: 'Dados recuperados, payload salvo e IN100 iniciada. Aguardando autorização do cliente.'
+        missingData,
+        message: responseMessage
       });
     } catch (error: any) {
       const statusCode = error.response?.status || 500;
@@ -210,13 +241,13 @@ export class SimulationController {
   public async checkIn100AndFinish(req: Request, res: Response): Promise<void> {
     try {
       const { internalId } = req.params;
-      const { latitude, longitude } = req.body; // Geolocalização real enviada pelo client
+      const { latitude, longitude, borrowerDataOverrides } = req.body; // Geolocalização e dados vitais preenchidos
 
       if (!internalId) {
         throw new Error('Parâmetro obrigatório ausente: internalId.');
       }
 
-      const result = await in100WorkerUseCase.executeForSimulation(Number(internalId), undefined, latitude, longitude);
+      const result = await in100WorkerUseCase.executeForSimulation(Number(internalId), undefined, latitude, longitude, borrowerDataOverrides);
       res.status(200).json(result);
     } catch (error: any) {
       res.status(500).json({ success: false, message: error.message, details: error.details });

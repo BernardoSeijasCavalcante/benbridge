@@ -35,7 +35,7 @@ export class IN100WorkerUseCase {
   }
 
   // Método principal que verifica uma simulação específica (Pode ser chamado manualmente pelo frontend)
-  public async executeForSimulation(internalId: number, dbInstance?: any, latitude?: string, longitude?: string): Promise<any> {
+  public async executeForSimulation(internalId: number, dbInstance?: any, latitude?: string, longitude?: string, borrowerDataOverrides?: any): Promise<any> {
     const db = dbInstance || await getDatabase();
     
     const simulation = await db.get('SELECT * FROM simulations WHERE id = ?', [internalId]);
@@ -60,6 +60,50 @@ export class IN100WorkerUseCase {
 
     try {
       const simulationPayload = JSON.parse(simulation.payload || '{}');
+
+      // Aplica os overrides enviados pelo usuário, caso existam dados faltantes vitais do Datahub
+      if (borrowerDataOverrides && simulationPayload.borrowerData) {
+        if (borrowerDataOverrides.name) {
+          simulationPayload.borrowerData.borrower.name = borrowerDataOverrides.name;
+        }
+        if (borrowerDataOverrides.birthDate) {
+          simulationPayload.borrowerData.borrower.birthDate = borrowerDataOverrides.birthDate;
+        }
+        if (borrowerDataOverrides.motherName) {
+          simulationPayload.borrowerData.borrower.motherName = borrowerDataOverrides.motherName;
+        }
+        if (borrowerDataOverrides.identity) {
+          simulationPayload.borrowerData.borrower.identity = borrowerDataOverrides.identity;
+        }
+        if (borrowerDataOverrides.document?.number) {
+          simulationPayload.borrowerData.borrower.document.number = borrowerDataOverrides.document.number;
+        }
+        if (borrowerDataOverrides.address) {
+          simulationPayload.borrowerData.borrower.address = {
+            ...simulationPayload.borrowerData.borrower.address,
+            ...borrowerDataOverrides.address
+          };
+        }
+        if (borrowerDataOverrides.benefit) {
+          simulationPayload.borrowerData.borrower.benefit = borrowerDataOverrides.benefit;
+        }
+        if (borrowerDataOverrides.benefitType) {
+          simulationPayload.borrowerData.borrower.benefitType = borrowerDataOverrides.benefitType;
+        }
+        if (borrowerDataOverrides.income) {
+          simulationPayload.borrowerData.borrower.income = borrowerDataOverrides.income;
+        }
+        if (borrowerDataOverrides.creditBankAccount) {
+          simulationPayload.borrowerData.creditBankAccount = {
+            ...simulationPayload.borrowerData.creditBankAccount,
+            ...borrowerDataOverrides.creditBankAccount
+          };
+        }
+        
+        await db.run('UPDATE simulations SET payload = ? WHERE id = ?', [JSON.stringify(simulationPayload), internalId]);
+        executionTrace.push('Dados da simulação atualizados com os overrides fornecidos pelo cliente.');
+      }
+
       const bankName = simulationPayload.bank || 'qualibank';
       const bankService = BankIntegrationFactory.getService(bankName);
 
